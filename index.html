@@ -1,0 +1,813 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, getDocs, addDoc, doc, updateDoc } from 'firebase/firestore';
+
+// --- CONFIG & FIREBASE INITIALIZATION ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'pai-game-01';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// --- AUDIO SYNTHESIS FOR SOUND EFFECTS ---
+const playSound = (type) => {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    
+    if (type === 'correct') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(500, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
+      gain.gain.setValueAtTime(0.5, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+      osc.start(); osc.stop(ctx.currentTime + 0.5);
+    } else if (type === 'wrong') {
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(300, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(150, ctx.currentTime + 0.2);
+      gain.gain.setValueAtTime(0.5, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
+      osc.start(); osc.stop(ctx.currentTime + 0.3);
+    } else if (type === 'yay') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(400, ctx.currentTime);
+      osc.frequency.setValueAtTime(600, ctx.currentTime + 0.1);
+      osc.frequency.setValueAtTime(800, ctx.currentTime + 0.2);
+      gain.gain.setValueAtTime(0.5, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.6);
+      osc.start(); osc.stop(ctx.currentTime + 0.6);
+    }
+  } catch (e) {
+    console.log("Audio not supported or interaction needed first.");
+  }
+};
+
+// --- DATA: MATERI, GAMES, ASSESSMENTS ---
+const GAME_DATA = {
+  p1: {
+    title: "Misi 1: Mengenal Zakat & Infak",
+    slides: [
+      { text: "Assalamualaikum! Halo, aku Kak Fadil. Hari ini kita akan bertualang belajar tentang Zakat dan Infak! Sudah siap?", icon: '👳‍♂️' },
+      { text: "Suatu hari, Fadil melihat banyak orang memberikan beras ke masjid di akhir bulan Ramadan. Tahukah kamu apa itu?", icon: '🕌' },
+      { title: "Zakat Fitrah", text: "Zakat menurut bahasa artinya suci, tumbuh, dan berkembang. Zakat fitrah wajib dibayar oleh umat Islam di bulan Ramadan berupa makanan pokok (seperti beras 2,5 kg atau 3,5 liter) sebelum Shalat Idul Fitri.", icon: '🍚' },
+      { title: "8 Golongan Penerima Zakat", text: "Zakat disalurkan kepada Mustahik (penerima): Fakir, Miskin, Amil, Mualaf, Riqab, Gharim, Fisabilillah, dan Ibnu Sabil.", icon: '🤲' },
+      { title: "Infak", text: "Berbeda dengan zakat yang wajib, Infak adalah membelanjakan harta untuk kebaikan yang jumlah dan waktunya bebas (sunah).", icon: '💰' },
+      { text: "Contoh infak: Memasukkan uang ke kotak amal masjid. Manfaatnya sangat besar untuk diri sendiri dan orang lain! Ayo kita mainkan gamenya!", icon: '🎮' }
+    ],
+    games: [
+      { type: 'quiz', title: 'Game 1: Pilih Jawaban Tepat', qs: [
+        {q:'Zakat fitrah wajib dikeluarkan berupa?', opts:['Makanan Pokok (Beras)', 'Buku Tulis'], a:0, msg:'Tepat! Zakat fitrah menggunakan makanan pokok setempat.'},
+        {q:'Orang yang berhak menerima zakat disebut?', opts:['Muzaki', 'Mustahik'], a:1, msg:'Benar! Muzaki adalah yang membayar, Mustahik adalah yang menerima.'}
+      ]},
+      { type: 'sort', title: 'Game 2: Susun Puzzle Zakat', instruction: 'Urutkan proses zakat fitrah dari awal hingga sampai ke penerima!', items: ['Niat membayar zakat di hati', 'Menyiapkan beras 2,5 kg', 'Membawa beras ke Amil di masjid', 'Amil membagikannya ke Mustahik'] },
+      { type: 'match', title: 'Game 3: Siapa Penerima Zakat?', pairs: [{l:'Fakir', r:'Sangat miskin, tidak punya harta/tenaga'}, {l:'Gharim', r:'Orang yang banyak hutang untuk kebaikan'}, {l:'Amil', r:'Panitia pengurus zakat'}] },
+      { type: 'scenario', title: 'Game 4: Petualangan Kotak Infak', qs: [
+        {q:'Di sekolahmu ada sumbangan untuk teman yang sakit. Apa tindakan terbaik?', opts:['Ikut menyumbang (infak) seikhlasnya', 'Pura-pura tidak tahu'], a:0, msg:'Luar biasa! Berinfak menumbuhkan kepedulian.'},
+        {q:'Saat Shalat Jumat, kotak amal lewat di depanmu. Kamu memiliki sisa uang jajan.', opts:['Menyimpannya untuk beli mainan semua', 'Memasukkan sebagian ke kotak amal'], a:1, msg:'Hebat! Berbagi tidak akan membuatmu miskin.'}
+      ]}
+    ],
+    assessment: [
+      { type: 'pg', id: 'p1_1', q: '1. Apa arti zakat secara bahasa?', options: ['Suci, tumbuh, berkembang', 'Menahan lapar', 'Berbagi makanan', 'Membayar denda'], a: 0, pembahasan: 'Zakat secara bahasa artinya suci, tumbuh, berkembang, dan berkah.' },
+      { type: 'pg', id: 'p1_2', q: '2. Zakat fitrah wajib dibayarkan pada waktu...', options: ['Awal tahun Hijriah', 'Bulan Ramadan sebelum shalat Idul Fitri', 'Bulan Dzulhijjah', 'Setiap hari Jumat'], a: 1, pembahasan: 'Wajib dibayar sejak terbenam matahari hari terakhir Ramadan hingga sebelum shalat Idul Fitri.' },
+      { type: 'pg', id: 'p1_3', q: '3. Berapa besaran zakat fitrah yang dibayarkan berupa beras?', options: ['1 kg', '2,5 kg atau 3,5 liter', '5 kg', '10 kg'], a: 1, pembahasan: 'Besaran zakat fitrah umumnya adalah 1 sha atau setara dengan 2,5 kg (3,5 liter) makanan pokok.' },
+      { type: 'pg', id: 'p1_4', q: '4. Golongan orang yang berhak menerima zakat disebut...', options: ['Muzaki', 'Amil', 'Mustahik', 'Mualaf'], a: 2, pembahasan: 'Mustahik adalah sebutan untuk orang yang berhak menerima zakat.' },
+      { type: 'pg', id: 'p1_5', q: '5. Mengeluarkan harta untuk kebaikan yang tidak ditentukan jumlah dan waktunya disebut...', options: ['Zakat', 'Infak', 'Pajak', 'Fidyah'], a: 1, pembahasan: 'Infak adalah membelanjakan atau mengeluarkan harta untuk kebaikan di jalan Allah.' },
+      { type: 'tf', id: 'p1_6', q: '6. Benar atau Salah: Zakat fitrah hanya wajib bagi orang dewasa.', options: ['Benar', 'Salah'], a: 1, pembahasan: 'Salah. Zakat fitrah wajib bagi seluruh umat Islam yang mampu, baik dewasa maupun anak-anak.' },
+      { type: 'tf', id: 'p1_7', q: '7. Benar atau Salah: Mualaf (orang yang baru masuk Islam) berhak menerima zakat.', options: ['Benar', 'Salah'], a: 0, pembahasan: 'Benar. Mualaf adalah salah satu dari 8 golongan penerima zakat (Asnaf).' },
+      { type: 'match', id: 'p1_8', q: '8. Pasangkan golongan penerima zakat ini dengan artinya!', pairs: [{l: 'Fakir', r: 'Orang yang tidak punya harta dan tenaga'}, {l: 'Ibnu Sabil', r: 'Musafir yang kehabisan bekal dalam perjalanan'}] },
+      { type: 'match', id: 'p1_9', q: '9. Pasangkan istilah berikut!', pairs: [{l: 'Muzaki', r: 'Orang yang wajib membayar zakat'}, {l: 'Amil', r: 'Panitia pengelola zakat'}] },
+      { type: 'case', id: 'p1_10', q: '10. Studi Kasus: Ahmad memiliki sisa uang jajan. Saat istirahat, ia memasukkannya ke kotak amal masjid sekolah. Apa yang dilakukan Ahmad?', options: ['Membayar zakat', 'Memberi hadiah', 'Berinfak', 'Membayar denda'], a: 2, pembahasan: 'Memasukkan uang ke kotak amal tanpa jumlah/waktu tertentu adalah contoh infak.' }
+    ]
+  },
+  p2: {
+    title: "Misi 2: Keajaiban Sedekah & Hadiah",
+    slides: [
+      { text: "Selamat datang kembali! Di Misi 2 ini, kita jelajahi keajaiban Sedekah dan Indahnya Hadiah.", icon: '👳‍♂️' },
+      { title: "Sedekah", text: "Sedekah sangat istimewa! Tidak hanya berupa harta (uang/barang), tetapi juga bisa nonmateri (jasa atau perbuatan baik). Semuanya harus dilakukan dengan ikhlas.", icon: '🤝' },
+      { title: "Sedekah Nonmateri", text: "Tersenyum ramah kepada teman, menyingkirkan duri di jalan, dan menolong orang tua adalah contoh sedekah perbuatan yang sangat dicintai Allah.", icon: '😊' },
+      { title: "Hadiah", text: "Hadiah adalah pemberian untuk memuliakan, mengapresiasi (seperti juara kelas), atau mempererat kasih sayang. Memberi hadiah membuat hubungan makin harmonis!", icon: '🎁' },
+      { title: "Adab Berbagi", text: "Ingat, berikan hadiah dan sedekah tanpa mengharap imbalan dan jangan pernah pamer (riya). Mari kita mulai tantangannya!", icon: '🎮' }
+    ],
+    games: [
+      { type: 'categorize', title: 'Game 1: Sedekah atau Bukan?', items: [{text: 'Menyingkirkan paku dari tengah jalan', cat: 'sedekah'}, {text: 'Memamerkan sepeda baru ke teman', cat: 'bukan'}, {text: 'Membantu ibu menyapu rumah', cat: 'sedekah'}] },
+      { type: 'catch', title: 'Game 2: Tangkap Kebaikan!', instruction: 'Tangkap benda yang melambangkan kebaikan (🎁, 💰, 🤝, 😊)! Hindari yang buruk (😠, 🗑️).' },
+      { type: 'quiz', title: 'Game 3: Berburu Hadiah', qs: [
+        {q:'Apa tujuan utama memberikan hadiah?', opts:['Agar dipuji orang', 'Mempererat tali persaudaraan'], a:1, msg:'Tepat sekali! Hadiah menumbuhkan rasa kasih sayang.'},
+        {q:'Bagaimana sikap yang benar saat menerima hadiah yang murah?', opts:['Berterimakasih dan bersyukur', 'Menolaknya'], a:0, msg:'Benar! Hargai setiap pemberian.'}
+      ]},
+      { type: 'scenario', title: 'Game 4: Pilih Perilaku Terbaik', qs: [
+        {q:'Temanmu mendapat nilai 100 dan juara kelas. Sikapmu?', opts:['Memberinya hadiah kecil dan ucapan selamat', 'Diam saja karena iri'], a:0, msg:'Keren! Itu sikap anak muslim yang baik.'}
+      ]}
+    ],
+    assessment: [
+      { type: 'pg', id: 'p2_1', q: '1. Sedekah tidak hanya berupa uang, tetapi bisa juga berupa...', options: ['Pujian palsu', 'Senyuman yang tulus', 'Barang curian', 'Tugas sekolah'], a: 1, pembahasan: 'Senyum yang tulus kepada saudara adalah bentuk sedekah termudah (nonmateri).' },
+      { type: 'pg', id: 'p2_2', q: '2. Memindahkan duri atau batu dari tengah jalan agar tidak membahayakan orang lain termasuk...', options: ['Zakat', 'Infak', 'Sedekah', 'Hadiah'], a: 2, pembahasan: 'Menyingkirkan rintangan dari jalan adalah contoh sedekah perbuatan yang berpahala besar.' },
+      { type: 'pg', id: 'p2_3', q: '3. Tujuan utama memberikan hadiah kepada teman adalah untuk...', options: ['Memamerkan kekayaan', 'Meminta imbalan', 'Mempererat tali persaudaraan', 'Agar dipuji guru'], a: 2, pembahasan: 'Hadiah diberikan untuk mempererat kasih sayang dan menghargai prestasi orang lain.' },
+      { type: 'pg', id: 'p2_4', q: '4. Sikap yang paling tepat saat menerima hadiah adalah...', options: ['Mencela karena murah', 'Mengucapkan terima kasih dan bersyukur', 'Membuangnya', 'Menyembunyikannya'], a: 1, pembahasan: 'Kita wajib bersyukur dan berterima kasih sekecil apa pun hadiah yang diterima.' },
+      { type: 'pg', id: 'p2_5', q: '5. Hukum bersedekah secara umum dalam Islam adalah...', options: ['Wajib', 'Sunah', 'Haram', 'Makruh'], a: 1, pembahasan: 'Hukum sedekah secara umum adalah sunah (sangat dianjurkan).' },
+      { type: 'tf', id: 'p2_6', q: '6. Benar atau Salah: Kita hanya boleh bersedekah jika sudah sangat kaya raya.', options: ['Benar', 'Salah'], a: 1, pembahasan: 'Salah. Sedekah bisa dilakukan kapan saja sesuai kemampuan, bahkan hanya dengan senyuman.' },
+      { type: 'tf', id: 'p2_7', q: '7. Benar atau Salah: Memberikan barang yang sudah rusak sebagai hadiah adalah adab yang baik.', options: ['Benar', 'Salah'], a: 1, pembahasan: 'Salah. Adab memberi hadiah/sedekah adalah memberikan sesuatu yang baik dan masih bermanfaat.' },
+      { type: 'match', id: 'p2_8', q: '8. Pasangkan contoh perbuatan berikut!', pairs: [{l: 'Membantu nenek menyeberang', r: 'Sedekah perbuatan'}, {l: 'Memberi kado ulang tahun', r: 'Hadiah'}] },
+      { type: 'match', id: 'p2_9', q: '9. Pasangkan hikmah berbagi berikut!', pairs: [{l: 'Manfaat bersedekah', r: 'Menolak bala dan memanjangkan umur ketaatan'}, {l: 'Manfaat hadiah', r: 'Menumbuhkan rasa saling mencintai'}] },
+      { type: 'case', id: 'p2_10', q: '10. Studi Kasus: Siti melihat temannya menangis karena kehilangan pensil. Siti meminjamkan pensilnya dan menghiburnya. Tindakan Siti termasuk...', options: ['Membayar zakat', 'Sedekah nonmateri', 'Sifat riya/pamer', 'Infak'], a: 1, pembahasan: 'Menghibur dan membantu meminjamkan barang adalah sedekah nonmateri.' }
+    ]
+  },
+  p3: {
+    title: "Misi 3: Pahlawan Kebaikan",
+    slides: [
+      { text: "Luar biasa! Kamu sampai di Misi 3. Saatnya menjadi Pahlawan Kebaikan sejati!", icon: '🦸‍♂️' },
+      { title: "Ringkasan Perbedaan", text: "Mari kita ingat: Zakat itu WAJIB dengan aturan khusus. Infak itu SUNAH berupa harta. Sedekah itu SUNAH (bisa harta/perbuatan). Hadiah adalah pemberian apresiasi kasih sayang.", icon: '📊' },
+      { title: "Hikmah Berbagi", text: "Berbagi membuat kita dekat dengan Allah, menumbuhkan rasa syukur, menghilangkan sifat egois dan kikir (pelit), serta menciptakan masyarakat yang damai dan peduli.", icon: '💖' },
+      { text: "Selesaikan 5 tantangan terakhir ini untuk meraih gelar Pahlawan Kebaikan!", icon: '🏆' }
+    ],
+    games: [
+      { type: 'doors', title: 'Game 1: 4 Pintu Kebaikan', qs: [{q:'Kewajiban harta di bulan Ramadan?', a:'Zakat Fitrah'}, {q:'Membelanjakan uang untuk kebaikan?', a:'Infak'}, {q:'Pemberian berupa jasa/perbuatan?', a:'Sedekah'}, {q:'Pemberian karena kasih sayang?', a:'Hadiah'}] },
+      { type: 'match', title: 'Game 2: Pasangkan Istilah', pairs: [{l:'Zakat', r:'Hukumnya Wajib'}, {l:'Infak', r:'Harta di jalan Allah'}, {l:'Sedekah', r:'Bisa berupa senyuman'}] },
+      { type: 'scenario', title: 'Game 3: Detektif Kebaikan', qs: [
+        {q:'Pak Ali memberikan 2,5 kg beras kepada Amil di masjid. Ini disebut?', opts:['Zakat Fitrah', 'Hadiah'], a:0, msg:'Benar! Beras 2,5 kg di masjid umumnya adalah Zakat Fitrah.'},
+        {q:'Andi membelikan ibu sebuah jilbab dengan uang tabungannya. Ini disebut?', opts:['Infak', 'Hadiah'], a:1, msg:'Tepat! Memberi sesuatu karena sayang kepada ibu adalah Hadiah.'}
+      ]},
+      { type: 'scenario', title: 'Game 4: Simulasi Desa Berbagi', qs: [
+        {q:'Desa kekeringan. Warga yang punya sumur bor membolehkan tetangga ambil air gratis. Ini mencerminkan?', opts:['Sedekah dan kepedulian', 'Sikap pamer kekayaan'], a:0, msg:'Betul! Berbagi meringankan beban sesama.'}
+      ]},
+      { type: 'quiz', title: 'Game 5: Tantangan Terakhir', qs: [
+        {q:'Berbagi akan membuat rezeki kita berkurang dan cepat habis.', opts:['Salah', 'Benar'], a:0, msg:'Hebat! Allah akan melipatgandakan rezeki orang yang berbagi.'},
+        {q:'Orang yang menolak membayar zakat fitrah padahal mampu, maka ia berdosa.', opts:['Benar', 'Salah'], a:0, msg:'Benar. Zakat fitrah hukumnya wajib (fardu ain).'}
+      ]}
+    ],
+    assessment: [
+      { type: 'pg', id: 'p3_1', q: '1. Kewajiban mengeluarkan harta tertentu (seperti beras) pada bulan Ramadan disebut...', options: ['Zakat Fitrah', 'Sedekah', 'Hadiah', 'Infak'], a: 0, pembahasan: 'Pengeluaran harta khusus berupa makanan pokok di bulan Ramadan adalah zakat fitrah.' },
+      { type: 'pg', id: 'p3_2', q: '2. Berikut ini yang BUKAN hikmah dari kebiasaan berbagi adalah...', options: ['Mendekatkan diri pada Allah', 'Mendapat pahala', 'Menjadi cepat miskin dan rugi', 'Mempererat persaudaraan'], a: 2, pembahasan: 'Berbagi tidak akan membuat miskin. Sebaliknya, harta menjadi berkah.' },
+      { type: 'pg', id: 'p3_3', q: '3. Kebiasaan berbagi membantu kita untuk menjauhi sifat buruk, yaitu...', options: ['Pemurah', 'Kikir atau pelit', 'Sabar', 'Ikhlas'], a: 1, pembahasan: 'Berbagi melatih hati kita untuk tidak kikir dan egois.' },
+      { type: 'pg', id: 'p3_4', q: '4. Kepada siapa zakat TIDAK BOLEH diberikan?', options: ['Orang sangat miskin', 'Orang kaya raya yang mampu', 'Amil (Panitia)', 'Ibnu Sabil (Musafir kehabisan bekal)'], a: 1, pembahasan: 'Orang yang sudah mampu dan kaya raya tidak berhak menerima zakat.' },
+      { type: 'pg', id: 'p3_5', q: '5. Syarat utama agar infak dan sedekah kita diterima oleh Allah Swt. adalah...', options: ['Dilihat banyak orang', 'Ikhlas karena Allah', 'Diunggah ke media sosial', 'Jumlahnya sangat besar'], a: 1, pembahasan: 'Niat yang ikhlas adalah kunci utama diterimanya seluruh ibadah.' },
+      { type: 'tf', id: 'p3_6', q: '6. Benar atau Salah: Memberi sedekah kepada pengemis dengan wajah marah dan membentak tetap mendapat pahala sempurna.', options: ['Benar', 'Salah'], a: 1, pembahasan: 'Salah. Sedekah harus diberikan dengan adab yang baik dan tidak menyakiti perasaan.' },
+      { type: 'tf', id: 'p3_7', q: '7. Benar atau Salah: Zakat diwajibkan bagi yang mampu, sedangkan infak dan sedekah dianjurkan kapan saja.', options: ['Benar', 'Salah'], a: 0, pembahasan: 'Benar. Perbedaan mendasarnya ada pada hukum wajib dan sunah serta ketentuannya.' },
+      { type: 'match', id: 'p3_8', q: '8. Pasangkan istilah kebaikan berikut!', pairs: [{l: 'Zakat', r: 'Kewajiban berbagi dengan aturan tertentu'}, {l: 'Infak', r: 'Membelanjakan harta untuk kebaikan (tanpa batas)'}] },
+      { type: 'match', id: 'p3_9', q: '9. Pasangkan istilah kebaikan berikut!', pairs: [{l: 'Sedekah', r: 'Berbagi harta maupun jasa secara ikhlas'}, {l: 'Hadiah', r: 'Pemberian untuk mengapresiasi atau mempererat hubungan'}] },
+      { type: 'case', id: 'p3_10', q: '10. Studi Kasus: Di desa ada musibah banjir. Fadil menyumbangkan pakaian layak, ibunya memasak, ayahnya ikut membersihkan jalan. Hikmah kejadian ini adalah...', options: ['Menghabiskan makanan di rumah', 'Menumbuhkan kepedulian dan gotong royong meringankan beban', 'Agar masuk televisi', 'Hanya untuk mencari kesibukan'], a: 1, pembahasan: 'Musibah adalah momen untuk bersatu, peduli, dan bergotong royong.' }
+    ]
+  }
+};
+
+
+// --- UI COMPONENTS ---
+
+const DialogBox = ({ text, icon }) => (
+  <div className="flex items-start bg-blue-50 p-4 rounded-3xl border-4 border-blue-200 mb-6 shadow-md transform transition-all animate-bounce-slight">
+    <div className="text-6xl mr-4 bg-white rounded-full p-2 shadow-sm">{icon}</div>
+    <div className="flex-1 bg-white p-4 rounded-2xl shadow-sm relative border border-gray-100">
+      <div className="absolute -left-2 top-6 w-4 h-4 bg-white transform rotate-45 border-l border-b border-gray-100"></div>
+      <p className="text-xl font-medium text-gray-700 leading-relaxed">{text}</p>
+    </div>
+  </div>
+);
+
+const Button = ({ children, onClick, variant = 'primary', className = '', disabled = false }) => {
+  const base = "px-6 py-3 rounded-2xl font-bold text-lg shadow-lg transform transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none";
+  const variants = {
+    primary: "bg-gradient-to-b from-blue-400 to-blue-600 text-white hover:from-blue-500 hover:to-blue-700",
+    success: "bg-gradient-to-b from-green-400 to-green-600 text-white hover:from-green-500 hover:to-green-700",
+    warning: "bg-gradient-to-b from-yellow-400 to-yellow-600 text-white hover:from-yellow-500 hover:to-yellow-700",
+    outline: "bg-white text-blue-600 border-2 border-blue-400 hover:bg-blue-50"
+  };
+  return <button disabled={disabled} onClick={onClick} className={`${base} ${variants[variant]} ${className}`}>{children}</button>;
+};
+
+// --- MINI GAMES ENGINE ---
+
+const QuizGame = ({ game, onComplete }) => {
+  const [qIdx, setQIdx] = useState(0);
+  const [msg, setMsg] = useState('');
+  const q = game.qs[qIdx];
+
+  const handleAns = (idx) => {
+    if (idx === q.a || (game.type === 'doors' && idx === q.a)) { // Doors simplified to match text if needed, but here it's index based
+      playSound('correct');
+      setMsg(q.msg || 'Tepat Sekali!');
+      setTimeout(() => {
+        setMsg('');
+        if (qIdx < game.qs.length - 1) setQIdx(i => i + 1);
+        else onComplete();
+      }, 1500);
+    } else {
+      playSound('wrong');
+      setMsg('Ups, kurang tepat. Coba lagi!');
+      setTimeout(() => setMsg(''), 1500);
+    }
+  };
+
+  return (
+    <div className="text-center animate-fade-in">
+      <h3 className="text-3xl font-bold text-blue-800 mb-6">{game.title}</h3>
+      <div className="bg-yellow-100 border-4 border-yellow-300 p-6 rounded-3xl mb-6 shadow-inner">
+        {game.type === 'doors' ? <div className="text-6xl mb-4">🚪</div> : null}
+        <p className="text-2xl font-bold text-gray-800">{q.q}</p>
+      </div>
+      <div className="space-y-4">
+        {q.opts ? q.opts.map((o, i) => (
+          <Button key={i} onClick={() => handleAns(i)} variant="outline" className="w-full text-left text-xl">{o}</Button>
+        )) : (
+          <Button onClick={() => handleAns(q.a)} variant="primary" className="w-full">Buka Pintu (Jawab: {q.a})</Button>
+        )}
+      </div>
+      {msg && <div className={`mt-6 p-4 rounded-xl font-bold text-xl ${msg.includes('Ups') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{msg}</div>}
+    </div>
+  );
+};
+
+const SortGame = ({ game, onComplete }) => {
+  const [items, setItems] = useState([...game.items].sort(() => Math.random() - 0.5));
+  const [msg, setMsg] = useState('');
+
+  const move = (idx, dir) => {
+    const newItems = [...items];
+    if (dir === -1 && idx > 0) { [newItems[idx], newItems[idx-1]] = [newItems[idx-1], newItems[idx]]; }
+    if (dir === 1 && idx < items.length - 1) { [newItems[idx], newItems[idx+1]] = [newItems[idx+1], newItems[idx]]; }
+    setItems(newItems);
+  };
+
+  const check = () => {
+    if (JSON.stringify(items) === JSON.stringify(game.items)) {
+      playSound('yay'); setMsg('Susunan Sempurna!'); setTimeout(onComplete, 2000);
+    } else {
+      playSound('wrong'); setMsg('Masih ada yang belum pas posisinya.'); setTimeout(() => setMsg(''), 2000);
+    }
+  };
+
+  return (
+    <div className="animate-fade-in">
+      <h3 className="text-3xl font-bold text-blue-800 mb-2 text-center">{game.title}</h3>
+      <p className="text-lg text-center text-gray-600 mb-6">{game.instruction}</p>
+      <div className="space-y-3 mb-6">
+        {items.map((item, i) => (
+          <div key={i} className="flex items-center bg-white border-2 border-blue-200 p-3 rounded-2xl shadow-sm">
+            <span className="text-2xl font-bold text-blue-400 w-8">{i+1}.</span>
+            <span className="flex-1 text-lg font-medium">{item}</span>
+            <div className="flex flex-col gap-1">
+              <button onClick={() => move(i, -1)} className="bg-blue-100 px-3 rounded hover:bg-blue-200">🔼</button>
+              <button onClick={() => move(i, 1)} className="bg-blue-100 px-3 rounded hover:bg-blue-200">🔽</button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <Button onClick={check} variant="success" className="w-full">Cek Jawaban</Button>
+      {msg && <div className="mt-4 text-center font-bold text-lg text-blue-700">{msg}</div>}
+    </div>
+  );
+};
+
+const MatchGame = ({ game, onComplete }) => {
+  const [rights, setRights] = useState([]);
+  const [answers, setAnswers] = useState({});
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => { setRights([...game.pairs.map(p=>p.r)].sort(() => Math.random() - 0.5)); }, []);
+
+  const check = () => {
+    const isCorrect = game.pairs.every(p => answers[p.l] === p.r);
+    if (isCorrect) {
+      playSound('yay'); setMsg('Semua pasangan cocok!'); setTimeout(onComplete, 2000);
+    } else {
+      playSound('wrong'); setMsg('Ada yang tertukar, coba cek lagi!'); setTimeout(() => setMsg(''), 2000);
+    }
+  };
+
+  return (
+    <div className="animate-fade-in">
+      <h3 className="text-3xl font-bold text-blue-800 mb-6 text-center">{game.title}</h3>
+      <div className="space-y-4 mb-6">
+        {game.pairs.map((p, i) => (
+          <div key={i} className="bg-blue-50 p-4 rounded-2xl border border-blue-200">
+            <p className="font-bold text-xl mb-2">{p.l}</p>
+            <select className="w-full p-3 rounded-xl border border-gray-300 text-lg" value={answers[p.l] || ''} onChange={e => setAnswers({...answers, [p.l]: e.target.value})}>
+              <option value="" disabled>-- Pilih Pasangan --</option>
+              {rights.map((r, j) => <option key={j} value={r}>{r}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+      <Button onClick={check} variant="primary" className="w-full">Periksa Pasangan</Button>
+      {msg && <div className="mt-4 text-center font-bold text-lg text-blue-700">{msg}</div>}
+    </div>
+  );
+};
+
+const CategorizeGame = ({ game, onComplete }) => {
+  const [idx, setIdx] = useState(0);
+  const [msg, setMsg] = useState('');
+  const item = game.items[idx];
+
+  const handleClick = (cat) => {
+    if (cat === item.cat) {
+      playSound('correct'); setMsg('Tepat!'); 
+      setTimeout(() => { setMsg(''); if(idx < game.items.length-1) setIdx(i=>i+1); else onComplete(); }, 1000);
+    } else {
+      playSound('wrong'); setMsg('Kurang tepat, ayo coba lagi!'); setTimeout(() => setMsg(''), 1000);
+    }
+  };
+
+  return (
+    <div className="text-center animate-fade-in">
+      <h3 className="text-3xl font-bold text-blue-800 mb-6">{game.title}</h3>
+      <div className="bg-white border-4 border-indigo-200 p-8 rounded-3xl mb-8 shadow-md">
+        <p className="text-2xl font-bold text-gray-800">{item.text}</p>
+      </div>
+      <div className="flex gap-4 justify-center">
+        <Button onClick={() => handleClick('sedekah')} variant="success" className="w-1/2">✅ Ini Sedekah</Button>
+        <Button onClick={() => handleClick('bukan')} variant="warning" className="w-1/2">❌ Bukan Sedekah</Button>
+      </div>
+      {msg && <div className="mt-6 text-xl font-bold text-blue-600">{msg}</div>}
+    </div>
+  );
+};
+
+const CatchGame = ({ game, onComplete }) => {
+  const [score, setScore] = useState(0);
+  const [items, setItems] = useState([]);
+  const [timeLeft, setTimeLeft] = useState(15);
+  const playing = useRef(true);
+
+  useEffect(() => {
+    const timer = setInterval(() => { if(playing.current) setTimeLeft(t => t - 1); }, 1000);
+    const spawner = setInterval(() => {
+      if(playing.current && Math.random() > 0.3) {
+        const isGood = Math.random() > 0.4;
+        const emoji = isGood ? ['🎁','💰','🤝','😊'][Math.floor(Math.random()*4)] : ['😠','🗑️'][Math.floor(Math.random()*2)];
+        setItems(prev => [...prev, { id: Date.now()+Math.random(), emoji, isGood, left: Math.random()*80+10, top: -10 }]);
+      }
+    }, 600);
+    return () => { clearInterval(timer); clearInterval(spawner); };
+  }, []);
+
+  useEffect(() => {
+    if (timeLeft <= 0) {
+      playing.current = false;
+      if (score >= 40) { playSound('yay'); onComplete(); }
+    }
+  }, [timeLeft, score]);
+
+  useEffect(() => {
+    const mover = setInterval(() => {
+      if(playing.current) setItems(prev => prev.map(i => ({...i, top: i.top + 3})).filter(i => i.top < 100));
+    }, 50);
+    return () => clearInterval(mover);
+  }, []);
+
+  const clickItem = (item) => {
+    if(!playing.current) return;
+    if(item.isGood) { playSound('correct'); setScore(s => s + 10); } 
+    else { playSound('wrong'); setScore(s => Math.max(0, s - 5)); }
+    setItems(prev => prev.filter(i => i.id !== item.id));
+  };
+
+  if (timeLeft <= 0 && score < 40) {
+    return (
+      <div className="text-center">
+        <h3 className="text-2xl font-bold mb-4">Waktu Habis! Skor kamu: {score}/40</h3>
+        <Button onClick={() => {setScore(0); setTimeLeft(15); playing.current=true; setItems([]);}}>Coba Lagi</Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="animate-fade-in relative h-96 bg-blue-50 border-4 border-blue-200 rounded-3xl overflow-hidden">
+      <div className="absolute top-2 left-4 text-xl font-bold bg-white px-3 rounded-xl shadow">Skor: {score}</div>
+      <div className="absolute top-2 right-4 text-xl font-bold bg-white px-3 rounded-xl shadow">Waktu: {timeLeft}s</div>
+      <p className="text-center mt-12 px-4 text-gray-500 font-medium opacity-50">{game.instruction}</p>
+      {items.map(i => (
+        <div key={i.id} onClick={() => clickItem(i)} className="absolute text-5xl cursor-pointer select-none transition-transform hover:scale-110 active:scale-90" style={{left: `${i.left}%`, top: `${i.top}%`}}>
+          {i.emoji}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// --- ASSESSMENT ENGINE ---
+
+const AssessmentEngine = ({ data, onFinish }) => {
+  const [answers, setAnswers] = useState({});
+  const [submitted, setSubmitted] = useState(false);
+  const [score, setScore] = useState(0);
+
+  const calculateScore = () => {
+    let correct = 0;
+    data.forEach(q => {
+      if (q.type === 'pg' || q.type === 'tf' || q.type === 'case') {
+        if (answers[q.id] === q.a) correct++;
+      } else if (q.type === 'match') {
+        if (q.pairs.every(p => answers[`${q.id}_${p.l}`] === p.r)) correct++;
+      }
+    });
+    const finalScore = correct * 10;
+    setScore(finalScore);
+    if(finalScore >= 70) playSound('yay'); else playSound('wrong');
+    setSubmitted(true);
+  };
+
+  if (submitted) {
+    return (
+      <div className="animate-fade-in p-2">
+        <div className={`p-8 rounded-3xl text-center shadow-lg mb-8 ${score >= 80 ? 'bg-green-100 border-4 border-green-400' : 'bg-yellow-100 border-4 border-yellow-400'}`}>
+          <h2 className="text-4xl font-black text-gray-800 mb-2">Asesmen Selesai!</h2>
+          <p className="text-6xl font-black my-4 text-blue-600">{score}</p>
+          <p className="text-2xl font-bold">{score >= 90 ? 'Sangat Baik! 🌟' : score >= 80 ? 'Baik! 👍' : score >= 70 ? 'Cukup Baik!' : 'Perlu Bimbingan, Tetap Semangat! 💪'}</p>
+        </div>
+        <div className="space-y-6">
+          <h3 className="text-2xl font-bold border-b pb-2">Pembahasan:</h3>
+          {data.map((q, i) => {
+            let isBenar = false;
+            let userAnsRaw = answers[q.id];
+            if (q.type === 'pg' || q.type === 'tf' || q.type === 'case') {
+              isBenar = userAnsRaw === q.a;
+            } else if (q.type === 'match') {
+              isBenar = q.pairs.every(p => answers[`${q.id}_${p.l}`] === p.r);
+            }
+            return (
+              <div key={q.id} className={`p-4 rounded-xl border-l-8 shadow-sm bg-white ${isBenar ? 'border-green-500' : 'border-red-500'}`}>
+                <p className="font-bold text-lg mb-2">{q.q}</p>
+                <p className={`font-semibold mb-2 ${isBenar ? 'text-green-600' : 'text-red-600'}`}>
+                  {isBenar ? '✅ Benar' : '❌ Salah'}
+                </p>
+                <div className="bg-blue-50 p-3 rounded-lg text-sm text-gray-700">
+                  <span className="font-bold text-blue-800">💡 Penjelasan: </span>
+                  {q.pembahasan || 'Pembahasan tidak tersedia.'}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="mt-8 text-center">
+          <Button onClick={() => onFinish(score)} variant="primary" className="w-full max-w-md">Simpan & Kembali ke Peta</Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="animate-fade-in p-2">
+      <DialogBox text="Saatnya menguji pengetahuanmu! Jawablah 10 pertanyaan ini dengan jujur. Semoga berhasil!" icon="📝" />
+      <div className="space-y-8 mt-6">
+        {data.map((q, i) => (
+          <div key={q.id} className="bg-white p-6 rounded-2xl shadow-sm border border-gray-200">
+            <p className="text-xl font-bold mb-4">{q.q}</p>
+            { (q.type === 'pg' || q.type === 'tf' || q.type === 'case') && (
+              <div className="space-y-2">
+                {q.options.map((opt, j) => (
+                  <label key={j} className="flex items-center space-x-3 p-3 rounded-xl border cursor-pointer hover:bg-blue-50 transition-colors">
+                    <input type="radio" name={q.id} className="w-5 h-5 text-blue-600" checked={answers[q.id] === j} onChange={() => setAnswers({...answers, [q.id]: j})} />
+                    <span className="text-lg">{opt}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            { q.type === 'match' && (
+              <div className="space-y-3 bg-gray-50 p-4 rounded-xl">
+                {q.pairs.map((p, j) => (
+                  <div key={j} className="flex flex-col sm:flex-row sm:items-center justify-between border-b pb-2">
+                    <span className="font-bold mb-2 sm:mb-0 sm:w-1/2">{p.l}</span>
+                    <select className="p-2 border rounded-lg sm:w-1/2 bg-white" value={answers[`${q.id}_${p.l}`] || ''} onChange={e => setAnswers({...answers, [`${q.id}_${p.l}`]: e.target.value})}>
+                      <option value="" disabled>-- Pilih Pasangan --</option>
+                      {[...q.pairs.map(x=>x.r)].sort().map((r, k) => <option key={k} value={r}>{r}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="mt-8 pt-4 border-t-2 border-dashed border-gray-300">
+        <Button onClick={calculateScore} variant="success" className="w-full">Selesai & Lihat Hasil</Button>
+      </div>
+    </div>
+  );
+};
+
+
+// --- MAIN APP COMPONENT ---
+
+export default function App() {
+  const [appState, setAppState] = useState('loading'); // loading, intro, loginSiswa, loginGuru, dashboard, map, level
+  const [student, setStudent] = useState(null);
+  const [currentLvl, setCurrentLvl] = useState(null);
+  
+  // Level State
+  const [lvlStage, setLvlStage] = useState('slides'); // slides, games, assessment
+  const [slideIdx, setSlideIdx] = useState(0);
+  const [gameIdx, setGameIdx] = useState(0);
+
+  // Forms
+  const [name, setName] = useState('');
+  const [kelas, setKelas] = useState('');
+  const [pin, setPin] = useState('');
+  const [teacherData, setTeacherData] = useState([]);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Auth init error:", e);
+      }
+    };
+    initAuth();
+
+    const unsub = onAuthStateChanged(auth, (u) => {
+      if(u) setAppState('intro');
+    });
+    return () => unsub();
+  }, []);
+
+  const handleStudentLogin = async (e) => {
+    e.preventDefault();
+    if(!name || !kelas) return setErr('Isi nama dan kelas!');
+    setErr(''); setAppState('loading');
+    try {
+      const qSnap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'students'));
+      let found = null;
+      qSnap.forEach(doc => {
+        const d = doc.data();
+        if(d.name.toLowerCase() === name.toLowerCase() && d.kelas === kelas) found = {id: doc.id, ...d};
+      });
+      if(!found) {
+        const newRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'students'), {
+          name, kelas, progress: { p1: false, p2: false, p3: false }, scores: { a1: 0, a2: 0, a3: 0 }, lastActive: Date.now()
+        });
+        found = { id: newRef.id, name, kelas, progress: { p1: false, p2: false, p3: false }, scores: { a1: 0, a2: 0, a3: 0 } };
+      }
+      setStudent(found); setAppState('map');
+    } catch(e) {
+      console.error(e); setErr('Gagal mengambil data.'); setAppState('loginSiswa');
+    }
+  };
+
+  const handleTeacherLogin = async (e) => {
+    e.preventDefault();
+    if(pin !== 'GURU5SD') return setErr('PIN Salah!');
+    setErr(''); setAppState('loading');
+    try {
+      const qSnap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'students'));
+      const data = [];
+      qSnap.forEach(doc => data.push({id: doc.id, ...doc.data()}));
+      setTeacherData(data); setAppState('dashboard');
+    } catch(e) {
+      console.error(e); setErr('Gagal memuat data.'); setAppState('loginGuru');
+    }
+  };
+
+  const startLevel = (lvl) => {
+    setCurrentLvl(lvl); setLvlStage('slides'); setSlideIdx(0); setGameIdx(0); setAppState('level');
+  };
+
+  const handleAssessmentFinish = async (score) => {
+    const updated = { ...student };
+    // Save highest score
+    if(currentLvl === 'p1') { updated.scores.a1 = Math.max(updated.scores.a1, score); updated.progress.p1 = true; }
+    if(currentLvl === 'p2') { updated.scores.a2 = Math.max(updated.scores.a2, score); updated.progress.p2 = true; }
+    if(currentLvl === 'p3') { updated.scores.a3 = Math.max(updated.scores.a3, score); updated.progress.p3 = true; }
+    
+    setStudent(updated);
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', student.id), {
+        scores: updated.scores, progress: updated.progress, lastActive: Date.now()
+      });
+    } catch (e) { console.error('Save failed', e); }
+    
+    setAppState('map');
+  };
+
+  // --- RENDERERS ---
+
+  if (appState === 'loading') {
+    return <div className="min-h-screen flex items-center justify-center bg-blue-50"><div className="text-2xl font-bold animate-pulse text-blue-600">Memuat Petualangan...</div></div>;
+  }
+
+  if (appState === 'intro') {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-blue-300 to-indigo-500 flex flex-col items-center justify-center p-6 text-center">
+        <div className="bg-white p-10 rounded-3xl shadow-2xl max-w-lg w-full animate-fade-in-up">
+          <div className="text-7xl mb-6">🕌🎒🎁</div>
+          <h1 className="text-4xl font-black text-blue-800 mb-2 leading-tight">PETUALANGAN BERBAGI KEBAIKAN</h1>
+          <p className="text-xl font-medium text-gray-600 mb-8">"Ayo Berbagi, Hidup Lebih Berarti!"</p>
+          <div className="space-y-4">
+            <Button onClick={() => setAppState('loginSiswa')} className="w-full text-xl py-4">Mulai Bermain (Siswa)</Button>
+            <Button onClick={() => setAppState('loginGuru')} variant="outline" className="w-full">Masuk sebagai Guru</Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (appState === 'loginSiswa' || appState === 'loginGuru') {
+    const isGuru = appState === 'loginGuru';
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-200 to-blue-400 flex items-center justify-center p-4">
+        <form onSubmit={isGuru ? handleTeacherLogin : handleStudentLogin} className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full relative">
+          <button type="button" onClick={()=>setAppState('intro')} className="absolute top-4 left-4 text-gray-400 hover:text-gray-800">🔙 Batal</button>
+          <h2 className="text-3xl font-bold text-center mb-6 mt-4">{isGuru ? 'Dasbor Guru' : 'Identitas Pahlawan'}</h2>
+          
+          {!isGuru ? (
+            <>
+              <input required value={name} onChange={e=>setName(e.target.value)} placeholder="Nama Panggilan" className="w-full p-4 mb-4 rounded-xl border-2 border-gray-200 focus:border-blue-500 focus:outline-none text-lg" />
+              <select required value={kelas} onChange={e=>setKelas(e.target.value)} className="w-full p-4 mb-6 rounded-xl border-2 border-gray-200 focus:border-blue-500 focus:outline-none text-lg">
+                <option value="" disabled>Pilih Kelas</option>
+                <option value="5A">Kelas 5A</option>
+                <option value="5B">Kelas 5B</option>
+                <option value="5C">Kelas 5C</option>
+              </select>
+            </>
+          ) : (
+            <input required type="password" value={pin} onChange={e=>setPin(e.target.value)} placeholder="PIN Guru (GURU5SD)" className="w-full p-4 mb-6 rounded-xl border-2 border-gray-200 focus:border-blue-500 focus:outline-none text-lg" />
+          )}
+          
+          {err && <p className="text-red-500 text-center mb-4 font-bold">{err}</p>}
+          <Button className="w-full" type="submit">{isGuru ? 'Buka Dasbor' : 'Lanjutkan Petualangan'}</Button>
+        </form>
+      </div>
+    );
+  }
+
+  if (appState === 'dashboard') {
+    return (
+      <div className="min-h-screen bg-gray-100 p-8">
+        <div className="max-w-6xl mx-auto bg-white p-8 rounded-3xl shadow-lg">
+          <div className="flex justify-between items-center mb-8 border-b pb-4">
+            <h2 className="text-3xl font-black text-gray-800">📊 Rekap Nilai Siswa</h2>
+            <Button onClick={() => setAppState('intro')} variant="outline">Keluar Dasbor</Button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="bg-blue-100 text-blue-900">
+                  <th className="p-4 rounded-tl-xl">Nama</th>
+                  <th className="p-4">Kelas</th>
+                  <th className="p-4">Misi 1 (Zakat & Infak)</th>
+                  <th className="p-4">Misi 2 (Sedekah & Hadiah)</th>
+                  <th className="p-4">Misi 3 (Final)</th>
+                  <th className="p-4 rounded-tr-xl">Rata-rata</th>
+                </tr>
+              </thead>
+              <tbody>
+                {teacherData.length === 0 ? <tr><td colSpan="6" className="text-center p-8 text-gray-500">Belum ada data siswa.</td></tr> : null}
+                {teacherData.map(s => {
+                  const avg = ((s.scores.a1 + s.scores.a2 + s.scores.a3) / 3).toFixed(1);
+                  return (
+                    <tr key={s.id} className="border-b hover:bg-gray-50">
+                      <td className="p-4 font-bold">{s.name}</td>
+                      <td className="p-4">{s.kelas}</td>
+                      <td className="p-4">{s.progress.p1 ? <span className="text-green-600 font-bold">{s.scores.a1}</span> : '-'}</td>
+                      <td className="p-4">{s.progress.p2 ? <span className="text-green-600 font-bold">{s.scores.a2}</span> : '-'}</td>
+                      <td className="p-4">{s.progress.p3 ? <span className="text-green-600 font-bold">{s.scores.a3}</span> : '-'}</td>
+                      <td className="p-4 font-black text-blue-600">{avg > 0 ? avg : '-'}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (appState === 'map') {
+    const p1Done = student.progress.p1;
+    const p2Done = student.progress.p2;
+    const p3Done = student.progress.p3;
+
+    return (
+      <div className="min-h-screen bg-blue-100 flex flex-col items-center justify-center p-4 relative overflow-hidden">
+        {/* Decorative BG */}
+        <div className="absolute top-0 w-full h-64 bg-blue-300 rounded-b-[50%] opacity-50 z-0"></div>
+        
+        <div className="z-10 bg-white p-8 rounded-3xl shadow-2xl max-w-2xl w-full text-center">
+          <div className="flex justify-between items-center mb-6">
+            <h2 className="text-2xl font-bold">Halo, {student.name}! 👋</h2>
+            <button onClick={()=>setAppState('intro')} className="text-red-500 font-bold hover:underline">Keluar</button>
+          </div>
+          
+          <h1 className="text-4xl font-black text-blue-800 mb-8">Peta Kebaikan</h1>
+          
+          <div className="space-y-6 relative">
+            {/* Level 1 */}
+            <div className="relative">
+              <Button onClick={() => startLevel('p1')} className="w-full py-6 flex items-center justify-between group">
+                <span className="text-2xl">1️⃣ Pertemuan 1</span>
+                <span>{p1Done ? `✅ Nilai: ${student.scores.a1}` : 'Mulai ▶️'}</span>
+              </Button>
+            </div>
+            
+            {/* Connector */}
+            <div className="h-8 border-l-4 border-dashed border-gray-400 mx-auto w-1"></div>
+
+            {/* Level 2 */}
+            <div className="relative">
+              <Button disabled={!p1Done} onClick={() => startLevel('p2')} className={`w-full py-6 flex items-center justify-between ${!p1Done ? 'opacity-70 bg-gray-400' : ''}`}>
+                <span className="text-2xl">2️⃣ Pertemuan 2</span>
+                <span>{!p1Done ? '🔒 Terkunci' : p2Done ? `✅ Nilai: ${student.scores.a2}` : 'Mulai ▶️'}</span>
+              </Button>
+            </div>
+
+            {/* Connector */}
+            <div className="h-8 border-l-4 border-dashed border-gray-400 mx-auto w-1"></div>
+
+            {/* Level 3 */}
+            <div className="relative">
+              <Button disabled={!p2Done} onClick={() => startLevel('p3')} className={`w-full py-6 flex items-center justify-between ${!p2Done ? 'opacity-70 bg-gray-400' : ''}`} variant="warning">
+                <span className="text-2xl">3️⃣ Misi Final</span>
+                <span>{!p2Done ? '🔒 Terkunci' : p3Done ? `🏆 LULUS! (${student.scores.a3})` : 'Mulai Puncak ▶️'}</span>
+              </Button>
+            </div>
+          </div>
+          
+          {p3Done && (
+            <div className="mt-8 p-4 bg-yellow-100 border-4 border-yellow-400 rounded-2xl animate-bounce-slight">
+              <p className="text-xl font-bold">🎉 SELAMAT! Kamu telah menjadi PAHLAWAN KEBAIKAN! 🏅</p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (appState === 'level') {
+    const data = GAME_DATA[currentLvl];
+    
+    return (
+      <div className="min-h-screen bg-blue-50 flex items-center justify-center p-4 py-12">
+        <div className="max-w-3xl w-full bg-white rounded-3xl shadow-xl overflow-hidden relative min-h-[600px] flex flex-col">
+          {/* Header */}
+          <div className="bg-blue-600 text-white p-4 flex justify-between items-center shadow-md z-10">
+            <h2 className="font-bold text-lg truncate pr-4">{data.title}</h2>
+            <button onClick={() => setAppState('map')} className="text-blue-100 hover:text-white shrink-0">❌ Batal</button>
+          </div>
+
+          <div className="flex-1 p-6 sm:p-10 overflow-y-auto">
+            {/* Stage: Slides */}
+            {lvlStage === 'slides' && (
+              <div className="animate-fade-in flex flex-col h-full justify-between">
+                <div>
+                  <div className="flex justify-center mb-8">
+                    <span className="bg-blue-100 text-blue-800 font-bold px-4 py-1 rounded-full text-sm">
+                      Materi {slideIdx + 1} / {data.slides.length}
+                    </span>
+                  </div>
+                  {data.slides[slideIdx].title && <h3 className="text-3xl font-black text-center mb-6 text-gray-800">{data.slides[slideIdx].title}</h3>}
+                  <DialogBox text={data.slides[slideIdx].text} icon={data.slides[slideIdx].icon} />
+                </div>
+                <div className="mt-8">
+                  <Button className="w-full" onClick={() => {
+                    if (slideIdx < data.slides.length - 1) setSlideIdx(s => s + 1);
+                    else setLvlStage('games');
+                  }}>
+                    {slideIdx < data.slides.length - 1 ? 'Selanjutnya ➡️' : 'Mulai Misi! 🚀'}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Stage: Games */}
+            {lvlStage === 'games' && (
+              <div className="animate-fade-in flex flex-col h-full">
+                <div className="flex justify-center mb-6">
+                  <span className="bg-yellow-100 text-yellow-800 font-bold px-4 py-1 rounded-full text-sm">
+                    Tantangan {gameIdx + 1} / {data.games.length}
+                  </span>
+                </div>
+                <div className="flex-1 flex flex-col justify-center">
+                  {data.games[gameIdx].type === 'quiz' && <QuizGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                  {data.games[gameIdx].type === 'scenario' && <QuizGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                  {data.games[gameIdx].type === 'doors' && <QuizGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                  {data.games[gameIdx].type === 'sort' && <SortGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                  {data.games[gameIdx].type === 'match' && <MatchGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                  {data.games[gameIdx].type === 'categorize' && <CategorizeGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                  {data.games[gameIdx].type === 'catch' && <CatchGame game={data.games[gameIdx]} onComplete={() => { if(gameIdx < data.games.length-1) setGameIdx(i=>i+1); else setLvlStage('assessment'); }} />}
+                </div>
+              </div>
+            )}
+
+            {/* Stage: Assessment */}
+            {lvlStage === 'assessment' && (
+              <AssessmentEngine data={data.assessment} onFinish={handleAssessmentFinish} />
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
